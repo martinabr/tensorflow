@@ -40,19 +40,21 @@ limitations under the License.
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
-#include "mlir/Analysis/Verifier.h"  // TF:llvm-project
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "mlir/IR/Attributes.h"  // TF:llvm-project
-#include "mlir/IR/Builders.h"  // TF:llvm-project
-#include "mlir/IR/Function.h"  // TF:llvm-project
-#include "mlir/IR/Identifier.h"  // TF:llvm-project
-#include "mlir/IR/Location.h"  // TF:llvm-project
-#include "mlir/IR/MLIRContext.h"  // TF:llvm-project
-#include "mlir/IR/Module.h"  // TF:llvm-project
-#include "mlir/IR/OpDefinition.h"  // TF:llvm-project
-#include "mlir/IR/StandardTypes.h"  // TF:llvm-project
-#include "mlir/IR/Types.h"  // TF:llvm-project
+#include "mlir/Analysis/Verifier.h"  // from @llvm-project
+#include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
+#include "mlir/IR/Attributes.h"  // from @llvm-project
+#include "mlir/IR/Builders.h"  // from @llvm-project
+#include "mlir/IR/Diagnostics.h"  // from @llvm-project
+#include "mlir/IR/Function.h"  // from @llvm-project
+#include "mlir/IR/Identifier.h"  // from @llvm-project
+#include "mlir/IR/Location.h"  // from @llvm-project
+#include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/Module.h"  // from @llvm-project
+#include "mlir/IR/OpDefinition.h"  // from @llvm-project
+#include "mlir/IR/StandardTypes.h"  // from @llvm-project
+#include "mlir/IR/Types.h"  // from @llvm-project
 #include "tensorflow/compiler/jit/shape_inference_helpers.h"
 #include "tensorflow/compiler/mlir/op_or_arg_name_mapper.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/control_flow_ops.h"
@@ -63,6 +65,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/tensorflow/translate/mlir_roundtrip_flags.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/convert_tensor.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/convert_type.h"
+#include "tensorflow/compiler/mlir/tensorflow/utils/error_util.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/mangling_util.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/translate_utils.h"
 #include "tensorflow/compiler/tf2xla/functionalize_control_flow.h"
@@ -162,7 +165,8 @@ class ImporterBase {
         specs_(specs),
         debug_info_(debug_info),
         function_name_for_debug_info_(function_name_for_debug_info),
-        function_name_uniquifier_(function_name_uniquifier) {}
+        function_name_uniquifier_(function_name_uniquifier),
+        error_handler_(module.getContext()) {}
 
   // Returns the inferred function signature of the given function body. Input
   // types are unranked tensor of the respective datatype in the function and
@@ -318,8 +322,9 @@ class ImporterBase {
   // the location.
   mlir::Location GetLocation(const NodeDef& node);
 
-  // Gets the location information string for the given node.
-  std::string GetLocationStr(const Node& node);
+  // Appends the location string for the node to the error message and returns
+  // the combined error status.
+  Status EmitErrorWithLocationStr(const Node& node, const Status& error_status);
 
   // Inserts a placeholder node in the graph to replace a feed output tensor,
   // and returns the new placeholder node and a boolean indicating if the
@@ -368,6 +373,7 @@ class ImporterBase {
   NodeValueMap node_values_;
   std::unique_ptr<ShapeRefiner> shape_refiner_;
   NameUniquifier* function_name_uniquifier_;
+  mlir::StatusScopedDiagnosticHandler error_handler_;
 
  protected:
   // Maps feed as TensorId to new Placeholder node name.
@@ -669,9 +675,10 @@ Status ImporterBase::AddNodesToShapeRefiner() {
           remapped_feeds_[{it->first, index}] = placeholder_node->name();
           node_name_map[placeholder_node->name()] = placeholder_node;
           // Add the new placeholder node to the shape refiner.
-          TF_RETURN_WITH_CONTEXT_IF_ERROR(
-              shape_refiner_->AddNode(placeholder_node),
-              GetLocationStr(*placeholder_node));
+          Status status = shape_refiner_->AddNode(placeholder_node);
+          if (!status.ok()) {
+            return EmitErrorWithLocationStr(*placeholder_node, status);
+          }
         }
       } else {
         auto index_it = it->second.find(0);
@@ -691,8 +698,10 @@ Status ImporterBase::AddNodesToShapeRefiner() {
     }
     if (!node_added_to_shape_refiner) {
       // Add the node to the shape refiner if the node hasn't been removed.
-      TF_RETURN_WITH_CONTEXT_IF_ERROR(shape_refiner_->AddNode(node),
-                                      GetLocationStr(*node));
+      Status status = shape_refiner_->AddNode(node);
+      if (!status.ok()) {
+        return EmitErrorWithLocationStr(*node, status);
+      }
     }
 
     auto set_shape_from_list_attr = [&](const AttrValue* attr) {
@@ -700,9 +709,11 @@ Status ImporterBase::AddNodesToShapeRefiner() {
       for (auto shape : llvm::enumerate(list.shape())) {
         auto* node_context = shape_refiner_->GetContext(node);
         shape_inference::ShapeHandle handle;
-        TF_RETURN_WITH_CONTEXT_IF_ERROR(
-            node_context->MakeShapeFromShapeProto(shape.value(), &handle),
-            GetLocationStr(*node));
+        Status status =
+            node_context->MakeShapeFromShapeProto(shape.value(), &handle);
+        if (!status.ok()) {
+          return EmitErrorWithLocationStr(*node, status);
+        }
         node_context->set_output(shape.index(), handle);
       }
       return Status::OK();
@@ -735,9 +746,11 @@ Status ImporterBase::AddNodesToShapeRefiner() {
       DCHECK(node_context != nullptr);
       if (const AttrValue* attr = node->attrs().Find("shape")) {
         shape_inference::ShapeHandle handle;
-        TF_RETURN_WITH_CONTEXT_IF_ERROR(
-            node_context->MakeShapeFromShapeProto(attr->shape(), &handle),
-            GetLocationStr(*node));
+        Status status =
+            node_context->MakeShapeFromShapeProto(attr->shape(), &handle);
+        if (!status.ok()) {
+          return EmitErrorWithLocationStr(*node, status);
+        }
         node_context->set_output(0, handle);
       } else if (const AttrValue* attr = node->attrs().Find("_output_shapes")) {
         TF_RETURN_IF_ERROR(set_shape_from_list_attr(attr));
@@ -813,9 +826,12 @@ Status ImporterBase::AddNodesToShapeRefiner() {
         existing.push_back(shape_context->output(o));
       }
       bool inferred = false;
-      TF_RETURN_WITH_CONTEXT_IF_ERROR(
-          shape_refiner_->UpdateNode(node, /*relax=*/false, &inferred),
-          GetLocationStr(*node));
+      shape_inference::ShapeHandle handle;
+      Status status =
+          shape_refiner_->UpdateNode(node, /*relax=*/false, &inferred);
+      if (!status.ok()) {
+        return EmitErrorWithLocationStr(*node, status);
+      }
       for (int o = 0; o < shape_context->num_outputs(); ++o) {
         if (!same_inferred_shape(shape_context, shape_context->output(o),
                                  existing[o])) {
@@ -1346,13 +1362,11 @@ mlir::Location ImporterBase::GetLocation(const NodeDef& node_def) {
   }
 }
 
-std::string ImporterBase::GetLocationStr(const Node& node) {
-  const auto location = GetLocation(node.def());
-  std::string s;
-  llvm::raw_string_ostream ss(s);
-  location.print(ss);
-  ss.flush();
-  return s;
+Status ImporterBase::EmitErrorWithLocationStr(const Node& node,
+                                              const Status& error_status) {
+  const mlir::Location location = GetLocation(node.def());
+  mlir::emitError(location);
+  return error_handler_.Combine(error_status);
 }
 
 mlir::Operation* ImporterBase::createOperation(
@@ -2079,7 +2093,7 @@ Status GraphDefImporter::GetControlRetsFromFunctionGraph(
 
 // Stateful helper class to import a TensorFlow model expressed in SavedModel
 // into an MLIR Module.
-class SavedModelImporter : public ImporterBase {
+class SavedModelObjectGraphImporter : public ImporterBase {
  public:
   // Main entry point: converts all functions in the given meta graph to an MLIR
   // Module.
@@ -2088,7 +2102,7 @@ class SavedModelImporter : public ImporterBase {
       absl::Span<std::string> exported_names, bool add_default_attributes);
 
  private:
-  explicit SavedModelImporter(
+  explicit SavedModelObjectGraphImporter(
       const FunctionLibraryDefinition& flib, const GraphDebugInfo& debug_info,
       const GraphImportConfig& specs, mlir::ModuleOp module,
       std::unordered_map<std::string, std::string>* tf_name_to_mlir_name,
@@ -2785,7 +2799,7 @@ Status CreateSavedModelIR(
   return Status::OK();
 }
 
-StatusOr<mlir::OwningModuleRef> SavedModelImporter::Convert(
+StatusOr<mlir::OwningModuleRef> SavedModelObjectGraphImporter::Convert(
     SavedModelV2Bundle* saved_model, mlir::MLIRContext* context,
     absl::Span<std::string> exported_names, bool add_default_attributes) {
   GraphDebugInfo dummy_debug_info;
@@ -2814,8 +2828,9 @@ StatusOr<mlir::OwningModuleRef> SavedModelImporter::Convert(
       ConvertGraphDefToGraph(options, preprocessed_graphdef, &graph));
 
   NameUniquifier function_name_uniquifier(graph.flib_def());
-  SavedModelImporter importer(graph.flib_def(), debug_info, specs, module.get(),
-                              &tf_name_to_mlir_name, &function_name_uniquifier);
+  SavedModelObjectGraphImporter importer(graph.flib_def(), debug_info, specs,
+                                         module.get(), &tf_name_to_mlir_name,
+                                         &function_name_uniquifier);
 
   auto fn_names = graph.flib_def().ListFunctionNames();
   for (const auto& fn_name : fn_names) {
@@ -2856,20 +2871,20 @@ StatusOr<mlir::OwningModuleRef> SavedModelImporter::Convert(
 
 // A helper class to import a TensorFlow model expressed in SavedModel V1 into
 // an MLIR Module in SavedModel dialect.
-class SavedModelV1Importer {
+class SavedModelSignatureDefImporter {
  public:
   // Main entry point: converts all functions (specified by SignatureDefs) in
   // the given meta graph to an MLIR Module.
   static StatusOr<mlir::OwningModuleRef> Convert(const SavedModelBundle& bundle,
                                                  mlir::MLIRContext* context) {
-    SavedModelV1Importer importer(bundle, context);
+    SavedModelSignatureDefImporter importer(bundle, context);
 
     return importer.ConvertSignatures();
   }
 
  private:
-  SavedModelV1Importer(const SavedModelBundle& bundle,
-                       mlir::MLIRContext* context)
+  SavedModelSignatureDefImporter(const SavedModelBundle& bundle,
+                                 mlir::MLIRContext* context)
       : bundle_(bundle),
         module_(mlir::ModuleOp::create(mlir::UnknownLoc::get(context))) {}
 
@@ -2905,7 +2920,8 @@ class SavedModelV1Importer {
   mlir::OwningModuleRef module_;
 };
 
-StatusOr<mlir::OwningModuleRef> SavedModelV1Importer::ConvertSignatures() {
+StatusOr<mlir::OwningModuleRef>
+SavedModelSignatureDefImporter::ConvertSignatures() {
   const auto& signatures = bundle_.GetSignatures();
   const auto& graphdef = bundle_.meta_graph_def.graph_def();
   PopulateTfVersions(module_.get(), graphdef.versions());
@@ -2944,7 +2960,7 @@ StatusOr<mlir::OwningModuleRef> SavedModelV1Importer::ConvertSignatures() {
   return std::move(module_);
 }
 
-Status SavedModelV1Importer::ConvertSignature(
+Status SavedModelSignatureDefImporter::ConvertSignature(
     const GraphDef& graphdef, const std::string& sig_def_key,
     const std::map<std::string, TensorInfo>& inputs_sorted,
     const std::map<std::string, TensorInfo>& outputs_sorted,
@@ -3008,7 +3024,7 @@ Status SavedModelV1Importer::ConvertSignature(
   return Status::OK();
 }
 
-Status SavedModelV1Importer::LiftVariables() {
+Status SavedModelSignatureDefImporter::LiftVariables() {
   llvm::SmallVector<mlir::TF::VarHandleOp, 4> ops;
 
   bool contains_ref_variable = false;
@@ -3033,7 +3049,7 @@ Status SavedModelV1Importer::LiftVariables() {
   return Status::OK();
 }
 
-void SavedModelV1Importer::LiftVariable(mlir::TF::VarHandleOp op) {
+void SavedModelSignatureDefImporter::LiftVariable(mlir::TF::VarHandleOp op) {
   mlir::OpBuilder builder(&module_->getBodyRegion());
 
   auto func_op = op.getParentOfType<mlir::FuncOp>();
@@ -3063,7 +3079,7 @@ void SavedModelV1Importer::LiftVariable(mlir::TF::VarHandleOp op) {
   op.getOperation()->erase();
 }
 
-Status SavedModelV1Importer::ReadVariablesFromSession(
+Status SavedModelSignatureDefImporter::ReadVariablesFromSession(
     const llvm::SmallVectorImpl<mlir::TF::VarHandleOp>& ops) {
   mlir::OpBuilder builder(&module_->getBodyRegion());
 
@@ -3126,7 +3142,7 @@ Status SavedModelV1Importer::ReadVariablesFromSession(
   return Status::OK();
 }
 
-GraphImportConfig::InputArrays SavedModelV1Importer::ParseInputArrays(
+GraphImportConfig::InputArrays SavedModelSignatureDefImporter::ParseInputArrays(
     const std::map<std::string, TensorInfo>& inputs) {
   GraphImportConfig::InputArrays results;
   for (const auto& iter : inputs) {
@@ -3148,7 +3164,7 @@ GraphImportConfig::InputArrays SavedModelV1Importer::ParseInputArrays(
   return results;
 }
 
-std::vector<std::string> SavedModelV1Importer::ParseOutputArrays(
+std::vector<std::string> SavedModelSignatureDefImporter::ParseOutputArrays(
     const std::map<std::string, TensorInfo>& outputs) {
   std::vector<std::string> results;
   for (const auto& iter : outputs) {
@@ -3203,13 +3219,13 @@ StatusOr<mlir::OwningModuleRef> ConvertGraphToMlir(
 StatusOr<mlir::OwningModuleRef> ConvertSavedModelToMlir(
     SavedModelV2Bundle* saved_model, mlir::MLIRContext* context,
     absl::Span<std::string> exported_names, bool add_default_attributes) {
-  return SavedModelImporter::Convert(saved_model, context, exported_names,
-                                     add_default_attributes);
+  return SavedModelObjectGraphImporter::Convert(
+      saved_model, context, exported_names, add_default_attributes);
 }
 
 StatusOr<mlir::OwningModuleRef> ConvertSavedModelV1ToMlir(
     const SavedModelBundle& saved_model, mlir::MLIRContext* context) {
-  return SavedModelV1Importer::Convert(saved_model, context);
+  return SavedModelSignatureDefImporter::Convert(saved_model, context);
 }
 
 std::string MlirModuleToString(mlir::ModuleOp module, bool show_debug_info) {
