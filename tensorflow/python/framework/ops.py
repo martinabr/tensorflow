@@ -56,13 +56,13 @@ from tensorflow.python.framework import errors
 from tensorflow.python.framework import indexed_slices
 from tensorflow.python.framework import registry
 from tensorflow.python.framework import tensor_conversion_registry
-from tensorflow.python.framework import tensor_like
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import traceable_stack
 from tensorflow.python.framework import versions
 from tensorflow.python.ops import control_flow_util
 from tensorflow.python.platform import app
 from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.types import internal
 from tensorflow.python.util import compat
 from tensorflow.python.util import decorator_utils
 from tensorflow.python.util import deprecation
@@ -92,9 +92,19 @@ _api_usage_gauge = monitoring.BoolGauge(
     "/tensorflow/api/ops_eager_execution",
     "Whether ops.enable_eager_execution() is called.")
 
+_tensor_equality_api_usage_gauge = monitoring.BoolGauge(
+    "/tensorflow/api/enable_tensor_equality",
+    "Whether ops.enable_tensor_equality() is called.")
+
+_control_flow_api_gauge = monitoring.BoolGauge(
+    "/tensorflow/api/enable_control_flow_v2",
+    "Whether enable_control_flow_v2() is called.")
+
+_tf_function_api_guage = monitoring.BoolGauge(
+    "/tensorflow/api/tf_function",
+    "Whether tf.function() is used.")
 
 # pylint: disable=protected-access
-_TensorLike = tensor_like._TensorLike
 _DTYPES_INTERN_TABLE = dtypes._INTERN_TABLE
 # pylint: enable=protected-access
 
@@ -278,7 +288,9 @@ def enable_tensor_equality():
   unhashable. Thus tensors can no longer be directly used in sets or as a key in
   a dictionary.
   """
+  _tensor_equality_api_usage_gauge.get_cell().set(True)
   Tensor._USE_EQUALITY = True  # pylint: disable=protected-access
+
 
 @tf_export(v1=["disable_tensor_equality"])
 def disable_tensor_equality():
@@ -286,27 +298,32 @@ def disable_tensor_equality():
 
   This is a legacy behaviour of TensorFlow and is highly discouraged.
   """
+  _tensor_equality_api_usage_gauge.get_cell().set(False)
   Tensor._USE_EQUALITY = False  # pylint: disable=protected-access
 
 
+# TODO(mdan): This object should subclass Symbol, not just Tensor.
 @tf_export("Tensor")
-class Tensor(_TensorLike):
-  """A tensor represents a rectangular array of data.
+class Tensor(internal.NativeObject):
+  """A tensor is a multidimensional array of elements represented by a
 
-  When writing a TensorFlow program, the main object you manipulate and pass
-  around is the `tf.Tensor`. A `tf.Tensor` object represents a rectangular array
-  of arbitrary dimension, filled with data of a specific data type.
+  `tf.Tensor` object.  All elements are of a single known data type.
+
+  When writing a TensorFlow program, the main object that is
+  manipulated and passed around is the `tf.Tensor`.
 
   A `tf.Tensor` has the following properties:
 
-  * a data type (float32, int32, or string, for example)
+  * a single data type (float32, int32, or string, for example)
   * a shape
 
-  Each element in the Tensor has the same data type, and the data type is always
-  known.
+  TensorFlow supports eager execution and graph execution.  In eager
+  execution, operations are evaluated immediately.  In graph
+  execution, a computational graph is constructed for later
+  evaluation.
 
-  In eager execution, which is the default mode in TensorFlow, results are
-  calculated immediately.
+  TensorFlow defaults to eager execution.  In the example below, the
+  matrix multiplication results are calculated immediately.
 
   >>> # Compute some values using a Tensor
   >>> c = tf.constant([[1.0, 2.0], [3.0, 4.0]])
@@ -316,7 +333,6 @@ class Tensor(_TensorLike):
   tf.Tensor(
   [[1. 3.]
    [3. 7.]], shape=(2, 2), dtype=float32)
-
 
   Note that during eager execution, you may discover your `Tensors` are actually
   of type `EagerTensor`.  This is an internal detail, but it does give you
@@ -328,19 +344,22 @@ class Tensor(_TensorLike):
     [[1. 3.]
      [3. 7.]]
 
-  TensorFlow can define computations without immediately executing them, most
-  commonly inside `tf.function`s, as well as in (legacy) Graph mode. In those
-  cases, the shape (that is, the rank of the Tensor and the size of
-  each dimension) might be only partially known.
+  In TensorFlow, `tf.function`s are a common way to define graph execution.
+
+  A Tensor's shape (that is, the rank of the Tensor and the size of
+  each dimension) may not always be fully known.  In `tf.function`
+  definitions, the shape may only be partially known.
 
   Most operations produce tensors of fully-known shapes if the shapes of their
   inputs are also fully known, but in some cases it's only possible to find the
   shape of a tensor at execution time.
 
-  There are specialized tensors; for these, see `tf.Variable`, `tf.constant`,
-  `tf.placeholder`, `tf.SparseTensor`, and `tf.RaggedTensor`.
+  A number of specialized tensors are available: see `tf.Variable`,
+  `tf.constant`, `tf.placeholder`, `tf.sparse.SparseTensor`, and
+  `tf.RaggedTensor`.
 
-  For more on Tensors, see the [guide](https://tensorflow.org/guide/tensor`).
+  For more on Tensors, see the [guide](https://tensorflow.org/guide/tensor).
+
   """
 
   # List of Python operators that we allow to override.
@@ -606,14 +625,14 @@ class Tensor(_TensorLike):
 
     The shape inference functions propagate shapes to the extent possible:
 
-    >>> _ = my_matmul.get_concrete_function(
+    >>> f = my_matmul.get_concrete_function(
     ...   tf.TensorSpec([None,3]),
     ...   tf.TensorSpec([3,5]))
     Result shape: (None, 5)
 
     Tracing may fail if a shape missmatch can be detected:
 
-    >>> _ = my_matmul.get_concrete_function(
+    >>> cf = my_matmul.get_concrete_function(
     ...   tf.TensorSpec([None,3]),
     ...   tf.TensorSpec([4,5]))
     Traceback (most recent call last):
@@ -633,7 +652,7 @@ class Tensor(_TensorLike):
     ...   print("Result shape: ", a.shape)
     ...   return a
 
-    >>> _ = my_fun.get_concrete_function(
+    >>> cf = my_fun.get_concrete_function(
     ...   tf.TensorSpec([None, None]))
     Result shape: (5, 5)
 
@@ -698,7 +717,7 @@ class Tensor(_TensorLike):
     Trace the function, see the [Concrete Functions
     Guide](https://www.tensorflow.org/guide/concrete_function) for details.
 
-    >>> _ = load_image.get_concrete_function(
+    >>> cf = load_image.get_concrete_function(
     ...     tf.TensorSpec([], dtype=tf.string))
     Initial shape:  (None, None, 3)
     Final shape: (28, 28, 3)
@@ -872,8 +891,10 @@ class Tensor(_TensorLike):
   __array_priority__ = 100
 
   def __array__(self):
-    raise NotImplementedError("Cannot convert a symbolic Tensor ({}) to a numpy"
-                              " array.".format(self.name))
+    raise NotImplementedError(
+        "Cannot convert a symbolic Tensor ({}) to a numpy array."
+        " This error may indicate that you're trying to pass a Tensor to"
+        " a NumPy call, which is not supported".format(self.name))
 
   def __len__(self):
     raise TypeError("len is not well defined for symbolic Tensors. ({}) "
@@ -987,6 +1008,7 @@ class Tensor(_TensorLike):
 
 
 # TODO(agarwal): consider getting rid of this.
+# TODO(mdan): This object should not subclass ops.Tensor.
 class _EagerTensorBase(Tensor):
   """Base class for EagerTensor."""
 
@@ -5275,6 +5297,11 @@ def control_dependencies(control_inputs):
   See `tf.Graph.control_dependencies`
   for more details.
 
+  Note: *In TensorFlow 2 with eager and/or Autograph, you should not require
+  this method, as code executes in the expected order.* Only use
+  `tf.control_dependencies` when working with v1-style code or in a graph
+  context such as inside `Dataset.map`.
+
   When eager execution is enabled, any callable object in the `control_inputs`
   list will be called.
 
@@ -5978,9 +6005,12 @@ def _assert_same_graph(original_item, item):
   Raises:
     ValueError: if graphs do not match.
   """
-  if original_item.graph is not item.graph:
-    raise ValueError("%s must be from the same graph as %s." %
-                     (item, original_item))
+  original_graph = getattr(original_item, "graph", None)
+  graph = getattr(item, "graph", None)
+  if original_graph and graph and original_graph is not graph:
+    raise ValueError(
+        "%s must be from the same graph as %s (graphs are %s and %s)." %
+        (item, original_item, graph, original_graph))
 
 
 def _get_graph_from_inputs(op_input_list, graph=None):
@@ -6034,7 +6064,7 @@ def _get_graph_from_inputs(op_input_list, graph=None):
     # TODO(josh11b): Note that we exclude subclasses of Tensor. Need to clean this
     # up.
     graph_element = None
-    if (isinstance(op_input, (Operation, _TensorLike)) and
+    if (isinstance(op_input, (Operation, internal.NativeObject)) and
         ((not isinstance(op_input, Tensor)) or type(op_input) == Tensor)):  # pylint: disable=unidiomatic-typecheck
       graph_element = op_input
     else:
@@ -6043,7 +6073,7 @@ def _get_graph_from_inputs(op_input_list, graph=None):
     if graph_element is not None:
       if not graph:
         original_graph_element = graph_element
-        graph = graph_element.graph
+        graph = getattr(graph_element, "graph", None)
       elif original_graph_element is not None:
         _assert_same_graph(original_graph_element, graph_element)
       elif graph_element.graph is not graph:
